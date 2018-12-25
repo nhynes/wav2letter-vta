@@ -1,0 +1,5 @@
+*.bin
+*.json
+*.params
+*.o
+*.so
