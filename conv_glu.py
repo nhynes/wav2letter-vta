@@ -1,33 +1,27 @@
 import argparse
 from collections import defaultdict, OrderedDict
 
+from nnvm import sym
 import nnvm.compiler
 import tvm
-from tvm import relay
 import vta
 
 
 def _conv(data, ch_out, k, s, p, name):
-    weight = relay.var(f'{name}_weight')
-    bias = relay.var(f'{name}_bias')
-    conv = relay.nn.conv2d(data,
-                           weight,
-                           channels=ch_out,
-                           kernel_size=(1, k),
-                           strides=(1, s),
-                           padding=(0, p))
-    return relay.nn.bias_add(conv, bias)
+    return sym.conv2d(data,
+                      channels=ch_out,
+                      kernel_size=(1, k),
+                      strides=(1, s),
+                      padding=(0, p),
+                      out_dtype='int32')
 
 
 def _dense(data, units, name):
-    weight = relay.var(f'{name}_weight')
-    bias = relay.var(f'{name}_bias')
-    return relay.nn.bias_add(
-        relay.nn.dense(data, weight, units), bias)
+    return sym.dense(data, units=units, name=name)
 
 
 def make_net(network_arch, nfeat, nlabel, max_inp_len):
-    out = relay.var('data', shape=(1, nfeat, 1, max_inp_len), dtype='float32')  # NCHW
+    out = sym.Variable('data', shape=(1, nfeat, 1, max_inp_len))  # NCHW
 
     needs_flat = True
     itm_ctr = defaultdict(int)
@@ -48,29 +42,31 @@ def make_net(network_arch, nfeat, nlabel, max_inp_len):
             out = _conv(out, ch_out, k, s, p, name=f'conv_{itm_ctr[layer[0]]}')
 
         elif layer[0] == 'GLU':
-            # axis = int(layer[1])
-            out = relay.nn.glu(out, 1)
+            out = sym.glu(out, axis=1)
 
         elif layer[0] == 'DO':
-            out = relay.nn.dropout(out, float(layer[1]))
+            out = sym.dropout(out, rate=float(layer[1]))
 
         elif layer[0] == 'RO':  # reorder
             pass
-            # out = relay.transpose(out, tuple(map(int, layer[1:])))
 
         elif layer[0] == 'L':  # linear
             if layer[2] == 'NLABEL':
                 layer[2] = nlabel
             if needs_flat:
-                out = relay.reshape(out, (1, 908))
+                out = sym.flatten(out)
             out = _dense(out, int(layer[2]), name=f'dense_{itm_ctr[layer[0]]}')
             needs_flat = False
 
         else:
             raise RuntimeError('Unknown layer type: ' + layer[0])
 
-    args = relay.ir_pass.free_vars(out)
-    return relay.Function(args, out)
+    net = nnvm.graph.create(out)
+    nnvm.compiler.graph_util.infer_shape(net, **{'data': (1, 40, 1, max_inp_len)})
+    nnvm.compiler.graph_util.infer_dtype(net, **{'data': 'float32'})
+    # net = net.apply(['InferShape', 'InferType'])
+    # print(net.json())
+    return net
 
 
 def make_params(net, af_params_bin):
@@ -111,26 +107,20 @@ def main():
     net = make_net(args.network_arch, args.nfeat, args.nlabel, args.max_inp_len)
     params = make_params(net, args.af_params) if not args.no_params else None
 
-    with relay.build_config(opt_level=3):
-        if args.device == 'vta':
-            net = vta.graph.clean_cast(net)
-            net = vta.graph.clean_conv_fuse(net)
-            # net = vta.graph.pack(net, ...)  # ???
-            vta.build_config().__enter__()
+    net = vta.graph.clean_conv_fuse(net)
+    with nnvm.compiler.build_config(opt_level=3):
+        with vta.build_config():
+            graph, lib, params = nnvm.compiler.build(
+                net, params=params,
+                target=f'llvm -device={args.device}',
+                target_host='llvm')
 
-        graph, lib, params = relay.build(
-            net, params=params,
-            target=f'llvm -device={args.device}',
-            target_host='llvm')
-
-        if args.device == 'vta':
-            vta.build_config().__exit__()
-
-    lib.export_library('wav2letter2.so')
-    with open('wav2letter2.json', 'w') as f_graph_json:
-        f_graph_json.write(graph)
-    with open('wav2letter2.params', 'wb') as f_params:
-        f_params.write(nnvm.compiler.save_param_dict(params))
+    lib.export_library('wav2letter.o')
+    with open('wav2letter.json', 'w') as f_graph_json:
+        f_graph_json.write(graph.json())
+    if not args.no_params:
+        with open('wav2letter.params', 'wb') as f_params:
+            f_params.write(nnvm.compiler.save_param_dict(params))
 
 if __name__ == '__main__':
     main()
